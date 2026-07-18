@@ -1,0 +1,28 @@
+# ========================
+# Tor Server Configuration
+# ========================
+
+SOCKSPort 9050
+ControlPort 9051
+CookieAuthentication 1
+DataDirectory C:\Users\Ultra\Documents\tor-expert-bundle-windows-x86_64-14.5.7\Data\Tor
+
+# ------------------------
+# Public hidden service (optional)
+# ------------------------
+HiddenServiceDir C:\Users\Ultra\Documents\tor-expert-bundle-windows-x86_64-14.5.7\hidden_pub
+HiddenServicePort 80 127.0.0.1:8080
+
+# ------------------------
+# Private hidden service (client authorized)
+# ------------------------
+HiddenServiceDir C:\Users\Ultra\Documents\tor-expert-bundle-windows-x86_64-14.5.7\hidden_priv
+HiddenServicePort 80 127.0.0.1:8081
+HiddenServiceAuthorizeClient basic authorizeduser
+
+# ------------------------
+# Client Authorization for connecting to private hidden service
+# Replace yourhidden.onion and descriptor with the actual values
+ClientOnionAuthDir C:\Users\Ultra\Documents\tor-expert-bundle-windows-x86_64-14.5.7
+
+
