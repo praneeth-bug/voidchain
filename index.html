@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC P2P Video Chat</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: Arial, sans-serif;
+            padding: 20px;
+            background: #f0f0f0;
+            margin: 0;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-top: 0;
+        }
+        .video-container {
+            display: flex;
+            gap: 20px;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+        .video-wrapper {
+            flex: 1;
+            min-width: 300px;
+        }
+        video {
+            width: 100%;
+            background: #000;
+            border-radius: 4px;
+            display: block;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin: 10px 0;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        input[type="text"] {
+            flex: 1;
+            min-width: 200px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        button {
+            padding: 10px 20px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            white-space: nowrap;
+        }
+        button:hover:not(:disabled) {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        button.danger {
+            background: #dc3545;
+        }
+        button.danger:hover:not(:disabled) {
+            background: #c82333;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            background: #e7f3ff;
+            color: #004085;
+            border: 1px solid #bee5eb;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border-color: #f5c6cb;
+        }
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border-color: #c3e6cb;
+        }
+        h3 {
+            margin-top: 0;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>WebRTC P2P Video Chat</h1>
+        
+        <div class="controls">
+            <button id="startCamera">Start Camera</button>
+        </div>
+
+        <div class="video-container">
+            <div class="video-wrapper">
+                <h3>Local Video</h3>
+                <video id="localVideo" autoplay muted playsinline></video>
+            </div>
+            <div class="video-wrapper">
+                <h3>Remote Video</h3>
+                <video id="remoteVideo" autoplay playsinline></video>
+            </div>
+        </div>
+
+        <div class="controls">
+            <input type="text" id="remoteUrl" placeholder="Enter remote peer URL (e.g., ws://192.168.1.100:8080 or example.onion)">
+            <button id="startCall">Start Call</button>
+            <button id="endCall" class="danger" disabled>End Call</button>
+        </div>
+
+        <div id="status" class="status">Ready. Start your camera to begin.</div>
+    </div>
+
+    <script>
+        let localStream = null;
+        let peerConnection = null;
+        
+        // This is the permanent connection to our *own* server (localhost:8080)
+        let localServerConnection = null; 
+        
+        // This is the socket used for the *active call*.
+        // It can be localServerConnection (for Tor/incoming) or a new socket (for non-Tor outgoing)
+        let callSignalingSocket = null; 
+        
+        let myClientId = null; // Our ID, assigned by the server
+        let remoteClientId = null; // The ID of the peer we are talking to
+        
+        let isTorConnection = false;
+        let isInCall = false;
+
+        const localVideo = document.getElementById('localVideo');
+        const remoteVideo = document.getElementById('remoteVideo');
+        const startCameraBtn = document.getElementById('startCamera');
+        const startCallBtn = document.getElementById('startCall');
+        const endCallBtn = document.getElementById('endCall');
+        const remoteUrlInput = document.getElementById('remoteUrl');
+        const statusDiv = document.getElementById('status');
+
+        const configuration = {
+            iceServers: []
+        };
+
+        function updateStatus(message, type = 'info') {
+            statusDiv.textContent = message;
+            statusDiv.className = 'status';
+            if (type === 'error') {
+                statusDiv.className = 'status error';
+            } else if (type === 'success') {
+                statusDiv.className = 'status success';
+            }
+            console.log(`[${type.toUpperCase()}] ${message}`);
+        }
+
+        /**
+         * Sends a 'proxy-send' message and waits for the server's acknowledgment.
+         * This does *not* wait for the WebRTC answer, just for the proxy ack.
+         */
+        async function sendViaProxyAndWaitForAck(ws, message) {
+            return new Promise((resolve, reject) => {
+                if (ws.readyState !== WebSocket.OPEN) {
+                    return reject(new Error('WebSocket not open'));
+                }
+                
+                const responseHandler = (event) => {
+                    try {
+                        const response = JSON.parse(event.data);
+                        if (response.type === 'proxy-response') {
+                            ws.removeEventListener('message', responseHandler);
+                            if (response.success) {
+                                resolve(response);
+                            } else {
+                                reject(new Error(response.error || 'Proxy send failed'));
+                            }
+                        }
+                    } catch (e) {
+                        // Not a proxy response, ignore
+                    }
+                };
+                
+                ws.addEventListener('message', responseHandler);
+                ws.send(JSON.stringify(message));
+                
+                // Timeout for the *proxy acknowledgment*
+                setTimeout(() => {
+                    ws.removeEventListener('message', responseHandler);
+                    reject(new Error('Proxy acknowledgment timeout'));
+                }, 30000); 
+            });
+        }
+
+        async function startCamera() {
+            try {
+                updateStatus('Requesting camera access...');
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: true,
+                    audio: true
+                });
+                localVideo.srcObject = localStream;
+                startCameraBtn.disabled = true;
+                startCallBtn.disabled = false;
+                updateStatus('Camera started. Ready to make or receive calls.', 'success');
+            } catch (error) {
+                console.error('Camera error:', error);
+                updateStatus('Error accessing camera: ' + error.message, 'error');
+            }
+        }
+
+        function createPeerConnection() {
+            if (peerConnection) {
+                console.warn('Peer connection already exists');
+                return;
+            }
+
+            console.log('Creating peer connection...');
+            peerConnection = new RTCPeerConnection(configuration);
+
+            // NOTE: Track adding logic is in startCall (Caller) and handleSignalingMessage (Answerer) 
+            // to ensure it happens immediately before negotiation is triggered.
+
+            peerConnection.ontrack = (event) => {
+                console.log('Received remote track:', event.track.kind);
+                updateStatus('Receiving remote stream...', 'success');
+                if (remoteVideo.srcObject !== event.streams[0]) {
+                    remoteVideo.srcObject = event.streams[0];
+                }
+            };
+
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    console.log('New ICE candidate:', event.candidate.type);
+                    const message = {
+                        type: 'ice-candidate',
+                        candidate: event.candidate,
+                        targetClientId: remoteClientId // Tell server who to send to
+                    };
+                    
+                    if (isTorConnection && callSignalingSocket) {
+                        // Send via proxy (fire and forget, no ack needed for ICE)
+                        callSignalingSocket.send(JSON.stringify({
+                            type: 'proxy-send',
+                            url: remoteUrlInput.value.trim(),
+                            message: message
+                        }));
+                    } else if (callSignalingSocket && callSignalingSocket.readyState === WebSocket.OPEN) {
+                        // Send directly
+                        callSignalingSocket.send(JSON.stringify(message));
+                    }
+                }
+            };
+
+            peerConnection.onconnectionstatechange = () => {
+                const state = peerConnection.connectionState;
+                console.log('Connection state:', state);
+                updateStatus('Connection state: ' + state);
+                
+                if (state === 'connected') {
+                    updateStatus('Successfully connected to peer!', 'success');
+                } else if (state === 'failed') {
+                    updateStatus('Connection failed. Please check network and try again.', 'error');
+                } else if (state === 'disconnected') {
+                    updateStatus('Peer disconnected.', 'error');
+                    endCall();
+                }
+            };
+        }
+
+        /**
+         * Connects the 'callSignalingSocket' for an *outgoing* call.
+         */
+        function connectForOutgoingCall(url) {
+            return new Promise((resolve, reject) => {
+                let wsUrl = url.trim();
+                
+                // Check if it's a .onion URL
+                if (wsUrl.includes('.onion')) {
+                    isTorConnection = true;
+                    // Use our *local* server to proxy the call
+                    if (localServerConnection && localServerConnection.readyState === WebSocket.OPEN) {
+                        callSignalingSocket = localServerConnection;
+                        updateStatus('Using local server for Tor proxy', 'success');
+                        resolve();
+                    } else {
+                        reject(new Error('Local server connection not available for Tor proxy'));
+                    }
+                    return;
+                } 
+                
+                // It's a regular (non-Tor) URL
+                isTorConnection = false;
+                if (!wsUrl.startsWith('ws://') && !wsUrl.startsWith('wss://')) {
+                    wsUrl = 'ws://' + wsUrl;
+                }
+                
+                updateStatus('Connecting to remote signaling server...');
+                const newCallSocket = new WebSocket(wsUrl);
+
+                newCallSocket.onopen = () => {
+                    updateStatus('Connected to remote server', 'success');
+                    callSignalingSocket = newCallSocket; // Set the active socket
+                    resolve();
+                };
+
+                newCallSocket.onerror = (error) => {
+                    console.error('Remote WebSocket error:', error);
+                    reject(new Error('Failed to connect to remote server'));
+                };
+
+                // Handle *only responses* (answer, ice) from the remote peer
+                newCallSocket.onmessage = async (event) => {
+                    try {
+                        const message = JSON.parse(event.data);
+                        
+                        // We might get a welcome from the *remote* server
+                        if (message.type === 'welcome') {
+                            console.log('Registered with remote server');
+                            return; // We don't need its ID
+                        }
+
+                        // We received an answer or ICE candidate
+                        if (message.type === 'answer' || message.type === 'ice-candidate') {
+                            await handleSignalingMessage(message, message.senderId);
+                        }
+                    } catch (error) {
+                        console.error('Error handling remote message:', error);
+                    }
+                };
+
+                newCallSocket.onclose = () => {
+                    console.log('Remote signaling connection closed');
+                    if (peerConnection && peerConnection.connectionState !== 'connected') {
+                        updateStatus('Signaling connection lost', 'error');
+                    }
+                };
+            });
+        }
+
+        /**
+         * Processes incoming WebRTC messages (offer, answer, ice-candidate).
+         */
+        async function handleSignalingMessage(message, senderId) {
+            console.log('Handling signaling message:', message.type);
+
+            // Store the remote client's ID so we can send messages back
+            if (senderId) {
+                remoteClientId = senderId;
+                console.log('Stored remote client ID:', remoteClientId);
+            }
+            
+            if (!peerConnection) {
+                console.log('No peer connection, creating one for incoming call');
+                createPeerConnection();
+            }
+
+            try {
+                switch (message.type) {
+                    case 'offer':
+                        updateStatus('Received offer, creating answer...');
+                        await peerConnection.setRemoteDescription(new RTCSessionDescription(message.offer));
+                        
+                        // FIX: Ensure local tracks are added before creating the Answer SDP.
+                        if (localStream) {
+                            localStream.getTracks().forEach(track => {
+                                // Check if this specific track is already associated with a sender
+                                const alreadyAdded = peerConnection.getSenders().some(sender => sender.track === track);
+                                
+                                if (!alreadyAdded) {
+                                    console.log('Adding track:', track.kind);
+                                    peerConnection.addTrack(track, localStream);
+                                }
+                            });
+                        }
+                        
+                        const answer = await peerConnection.createAnswer();
+                        await peerConnection.setLocalDescription(answer);
+                        
+                        const answerMessage = {
+                            type: 'answer',
+                            answer: answer,
+                            targetClientId: remoteClientId // Send back to the caller
+                        };
+                        
+                        if (isTorConnection && callSignalingSocket) {
+                            // Send answer via proxy
+                            await sendViaProxyAndWaitForAck(callSignalingSocket, {
+                                type: 'proxy-send',
+                                url: remoteUrlInput.value.trim(),
+                                message: answerMessage
+                            });
+                        } else if (callSignalingSocket && callSignalingSocket.readyState === WebSocket.OPEN) {
+                            // Send answer directly
+                            callSignalingSocket.send(JSON.stringify(answerMessage));
+                        }
+                        updateStatus('Answer sent, establishing connection...');
+                        break;
+
+                    case 'answer':
+                        updateStatus('Received answer, establishing connection...');
+                        await peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
+                        break;
+
+                    case 'ice-candidate':
+                        if (message.candidate) {
+                            if (peerConnection.remoteDescription) {
+                                await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+                            } else {
+                                console.warn('Received ICE candidate before remote description, queuing...');
+                                // TODO: Implement queuing if this becomes an issue
+                            }
+                        }
+                        break;
+                        
+                    default:
+                        console.warn('Unknown signaling message type:', message.type);
+                }
+            } catch (error) {
+                console.error('Error handling signaling message:', error);
+                updateStatus('Error during signaling: ' + error.message, 'error');
+            }
+        }
+
+        async function startCall() {
+            if (!localStream) {
+                updateStatus('Please start camera first', 'error');
+                return;
+            }
+
+            const remoteUrl = remoteUrlInput.value.trim();
+            if (!remoteUrl) {
+                updateStatus('Please enter remote peer URL', 'error');
+                return;
+            }
+
+            if (isInCall) {
+                updateStatus('Already in a call', 'error');
+                return;
+            }
+
+            try {
+                updateStatus('Initiating call...');
+                isInCall = true;
+                
+                createPeerConnection();
+
+                // Tracks must be added right before createOffer to ensure they are in the SDP
+                localStream.getTracks().forEach(track => {
+                    console.log('Adding track:', track.kind);
+                    peerConnection.addTrack(track, localStream);
+                });
+                
+                await connectForOutgoingCall(remoteUrl);
+
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                
+                const offerMessage = {
+                    type: 'offer',
+                    offer: offer
+                    // No targetClientId needed, server will broadcast
+                };
+                
+                if (isTorConnection) {
+                    // For Tor, we send a proxy request to our *local* server
+                    updateStatus('Sending offer via Tor proxy...');
+                    await sendViaProxyAndWaitForAck(callSignalingSocket, {
+                        type: 'proxy-send',
+                        url: remoteUrl,
+                        message: offerMessage
+                    });
+                } else {
+                    // For non-Tor, we send the offer to the *remote* server
+                    updateStatus('Sending offer to remote server...');
+                    callSignalingSocket.send(JSON.stringify(offerMessage));
+                }
+
+                startCallBtn.disabled = true;
+                endCallBtn.disabled = false;
+                updateStatus('Offer sent, waiting for response...');
+            } catch (error) {
+                console.error('Error starting call:', error);
+                updateStatus('Error starting call: ' + error.message, 'error');
+                cleanupConnection();
+            }
+        }
+
+        function cleanupConnection() {
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            // Only close the socket if it's *not* our main local connection
+            if (callSignalingSocket && callSignalingSocket !== localServerConnection) {
+                callSignalingSocket.close();
+            }
+            callSignalingSocket = null;
+            
+            remoteClientId = null;
+            isTorConnection = false;
+            isInCall = false;
+            remoteVideo.srcObject = null;
+            startCallBtn.disabled = !localStream;
+            endCallBtn.disabled = true;
+        }
+
+        function endCall() {
+            cleanupConnection();
+            updateStatus('Call ended. Ready to receive calls.', 'success');
+        }
+
+        /**
+         * Connects to our *local* server (localhost:8080) to listen for incoming calls.
+         * This connection is permanent.
+         */
+        function listenForIncomingCalls() {
+            console.log('Starting to listen for incoming calls...');
+            
+            function attemptConnection() {
+                if (localServerConnection && localServerConnection.readyState === WebSocket.OPEN) {
+                    return; // Already connected
+                }
+                
+                localServerConnection = new WebSocket('ws://localhost:8080');
+                
+                localServerConnection.onopen = () => {
+                    console.log('Connected to local signaling server - listening...');
+                    updateStatus('Ready to receive calls', 'success');
+                };
+
+                localServerConnection.onmessage = async (event) => {
+                    try {
+                        const message = JSON.parse(event.data);
+                        console.log('Received message on local server:', message.type);
+                        
+                        switch(message.type) {
+                            case 'welcome':
+                                myClientId = message.clientId;
+                                console.log('My Server-Assigned ID:', myClientId);
+                                break;
+                            
+                            case 'proxy-response':
+                                // This is an ack for a proxy message we sent.
+                                // The sendViaProxyAndWaitForAck handles this.
+                                console.log('Received proxy-response (ack)');
+                                break;
+
+                            case 'offer':
+                                if (isInCall) {
+                                    console.warn('Ignoring incoming offer, already in a call.');
+                                    return;
+                                }
+                                updateStatus('Incoming call detected!', 'success');
+                                
+                                if (!localStream) {
+                                    updateStatus('Auto-starting camera for incoming call...');
+                                    await startCamera();
+                                }
+                                if (!localStream) {
+                                    updateStatus('Failed to start camera for incoming call.', 'error');
+                                    return;
+                                }
+
+                                isInCall = true;
+                                // For incoming calls, the call socket *is* our local server connection
+                                callSignalingSocket = localServerConnection;
+                                
+                                // Peer connection will be created inside handleSignalingMessage if null.
+                                
+                                // Handle the offer, passing the sender's ID
+                                await handleSignalingMessage(message, message.senderId); 
+                                
+                                startCallBtn.disabled = true;
+                                endCallBtn.disabled = false;
+                                break;
+                            
+                            case 'answer':
+                            case 'ice-candidate':
+                                // This would be a response to a Tor call we initiated
+                                if (isInCall && callSignalingSocket === localServerConnection) {
+                                    await handleSignalingMessage(message, message.senderId);
+                                }
+                                break;
+                        }
+
+                    } catch (error) {
+                        console.error('Error handling incoming message:', error);
+                    }
+                };
+
+                localServerConnection.onerror = (error) => {
+                    console.error('Local signaling error:', error);
+                };
+
+                localServerConnection.onclose = () => {
+                    console.log('Local signaling connection closed, reconnecting in 5s...');
+                    localServerConnection = null;
+                    if (isInCall && callSignalingSocket === localServerConnection) {
+                        updateStatus('Lost connection to signaling server during call.', 'error');
+                        endCall();
+                    }
+                    setTimeout(attemptConnection, 5000);
+                };
+            }
+
+            attemptConnection();
+        }
+
+        // --- Start Application ---
+
+        startCameraBtn.addEventListener('click', startCamera);
+        startCallBtn.addEventListener('click', startCall);
+        endCallBtn.addEventListener('click', endCall);
+
+        startCallBtn.disabled = true;
+        listenForIncomingCalls(); // Connect to our local server immediately
+        
+        window.addEventListener('beforeunload', () => {
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+            }
+            cleanupConnection();
+            if (localServerConnection) {
+                localServerConnection.close();
+            }
+        });
+    </script>
+</body>
+</html>
